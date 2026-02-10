@@ -47,6 +47,8 @@ SPEECH_HINT_RE = re.compile(
     r"\b(i|i'm|i've|i'll|you|you're|we|we're|what|why|how|can't|don't|won't|let's)\b",
     flags=re.IGNORECASE,
 )
+SPEAKER_NAME_RE = r"[A-Z][A-Za-z0-9'_-]{0,20}(?: [A-Za-z0-9'_-]{1,20}){0,5}"
+SPEAKER_LABEL_RE = re.compile(SPEAKER_NAME_RE + r":{1,2}\s*")
 
 
 def is_rick_speaker(name: str) -> bool:
@@ -111,6 +113,30 @@ def _drop_leading_stage_prefix(text: str) -> str:
     return out
 
 
+def _strip_speaker_label_noise(text: str) -> str:
+    """
+    Remove inline speaker labels and keep only Rick's first clean utterance.
+
+    Examples:
+      "Rick: Hi. Beth:: Hello." -> "Hi."
+      "I'm Rick... Morty: huh?" -> "I'm Rick..."
+    """
+    out = text.strip()
+    if not out:
+        return ""
+
+    # Remove a leading speaker tag if present.
+    out = re.sub(r"^\s*" + SPEAKER_LABEL_RE.pattern, "", out).strip()
+    if not out:
+        return ""
+
+    # Truncate at the next speaker label to avoid multi-speaker continuation.
+    m = re.search(r"(\s+|\n)" + SPEAKER_LABEL_RE.pattern, out)
+    if m:
+        out = out[: m.start()].strip()
+    return out
+
+
 def load_config():
     """Load configuration from `config.yaml` or fallback to `config_fixed.yaml`.
 
@@ -170,6 +196,7 @@ def clean_text(text: str) -> str:
     # Final whitespace normalization and punctuation cleanup
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\s+([,;:.!?])", r"\1", text).strip()
+    text = _strip_speaker_label_noise(text)
     return text
 
 
@@ -210,7 +237,11 @@ def is_valid_dialogue(text: str, min_length: int = 2) -> bool: # Reduced min_len
 
 
 def load_and_process_data(
-    max_retries: int = 3, min_dialogue_length: int = 2, context_window_size: int = 3
+    max_retries: int = 3,
+    min_dialogue_length: int = 2,
+    context_window_size: int = 3,
+    use_single_turn_prompt: bool = True,
+    require_question_prompt: bool = False,
 ):
     """
     Load Rick and Morty dataset and extract dialogue with context.
@@ -272,8 +303,8 @@ def load_and_process_data(
             if rick_count < 50:
                 raise ValueError(f"Insufficient data: only {rick_count} lines found.")
 
-            # --- CONTEXT GENERATION ---
-            # Train on: Prompt (context + "Rick Sanchez:") -> Response (Rick line)
+            # --- SUPERVISED PAIR GENERATION ---
+            # Train on: Prompt ("User: ...\nRick Sanchez:") -> Response (Rick line)
             training_pairs = []
 
             episode_col = next(
@@ -281,11 +312,29 @@ def load_and_process_data(
                 None,
             )
             
-            # Helper to format line
-            def format_line(idx):
-                speaker = df.iloc[idx]["character"]
-                text = clean_text(str(df.iloc[idx]["line"]))
-                return f"{speaker}: {text}"
+            def latest_non_rick_prompt(i: int, current_episode):
+                """
+                Return the nearest valid non-Rick utterance before index i.
+                """
+                for j in range(1, context_window_size + 1):
+                    prev_idx = i - j
+                    if prev_idx < 0:
+                        break
+                    if episode_col and df.iloc[prev_idx][episode_col] != current_episode:
+                        break
+
+                    prev_speaker = str(df.iloc[prev_idx]["character"]).strip()
+                    if is_rick_speaker(prev_speaker):
+                        continue
+
+                    prev_text = str(df.iloc[prev_idx]["line"])
+                    if not is_valid_dialogue(prev_text, min_length=min_dialogue_length):
+                        continue
+
+                    cleaned_prompt = clean_text(prev_text)
+                    if cleaned_prompt:
+                        return cleaned_prompt
+                return ""
 
             for i in range(len(df)):
                 row = df.iloc[i]
@@ -304,40 +353,23 @@ def load_and_process_data(
                     continue
                     
                 cleaned_response = clean_text(current_line_text)
+                if not cleaned_response:
+                    continue
                 
-                # Build context from previous lines
-                context_lines = []
                 current_episode = df.iloc[i][episode_col] if episode_col else None
-
-                # Look back up to 'context_window_size' lines
-                for j in range(1, context_window_size + 1):
-                    prev_idx = i - j
-                    if prev_idx < 0:
-                        break
-
-                    # Do not leak context across episode boundaries
-                    if episode_col and df.iloc[prev_idx][episode_col] != current_episode:
-                        break
-                    
-                    # Check if previous line is valid
-                    prev_text = str(df.iloc[prev_idx]["line"])
-                    if not is_valid_dialogue(
-                        prev_text, min_length=min_dialogue_length
-                    ):
-                        continue
-                        
-                    context_speaker = str(df.iloc[prev_idx]["character"]).strip()
-                    # Keep prompt style closer to inference (user asks, Rick responds)
-                    if re.match(r"(?i)^rick(\s+sanchez)?.*", context_speaker):
-                        continue
-
-                    context_lines.insert(0, format_line(prev_idx))
-
-                # Skip examples without preceding context to reduce noisy continuation behavior
-                if not context_lines:
+                prompt_text = latest_non_rick_prompt(i, current_episode)
+                if not prompt_text:
                     continue
 
-                prompt = "\n".join(context_lines) + "\nRick Sanchez:"
+                if require_question_prompt and "?" not in prompt_text:
+                    continue
+
+                # Keep prompt template consistent with inference.
+                if use_single_turn_prompt:
+                    prompt = f"User: {prompt_text}\nRick Sanchez:"
+                else:
+                    prompt = f"Morty: {prompt_text}\nRick Sanchez:"
+
                 # Leading space keeps tokenization natural after colon
                 response = f" {cleaned_response}"
                 training_pairs.append({"prompt": prompt, "response": response})
@@ -440,6 +472,8 @@ def main():
             max_retries=3,
             min_dialogue_length=min_dialogue_length,
             context_window_size=context_window_size,
+            use_single_turn_prompt=config["data"].get("use_single_turn_prompt", True),
+            require_question_prompt=config["data"].get("require_question_prompt", False),
         )
     except Exception as e:
         print(f"\n❌ Critical Error: Failed to load data: {e}")

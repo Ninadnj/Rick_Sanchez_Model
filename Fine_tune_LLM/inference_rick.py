@@ -11,6 +11,9 @@ import sys
 import yaml
 import re
 
+SPEAKER_NAME_RE = r"[A-Z][A-Za-z0-9'_-]{0,20}(?: [A-Za-z0-9'_-]{1,20}){0,5}"
+SPEAKER_LABEL_RE = SPEAKER_NAME_RE + r":{1,2}\s*"
+
 
 class RickInference:
     """Generate text in Rick Sanchez's voice."""
@@ -66,10 +69,10 @@ class RickInference:
     def generate_response(
         self,
         prompt: str,
-        max_new_tokens: int = 120,
-        temperature: float = 0.45,
-        top_p: float = 0.9,
-        top_k: int = 40,
+        max_new_tokens: int = 80,
+        temperature: float = 0.25,
+        top_p: float = 0.85,
+        top_k: int = 30,
         repetition_penalty: float = 1.15,
     ) -> str:
         """
@@ -87,9 +90,8 @@ class RickInference:
             Generated response
         """
         # Format prompt as a dialogue script to match training data
-        # Training format was: "Rick Sanchez: {text}"
-        # We simulate a conversation where Morty asks and Rick responds
-        full_prompt = f"Morty: {prompt}\n" f"Rick Sanchez:"
+        # Training format is single-turn: "User: ...\\nRick Sanchez:"
+        full_prompt = f"User: {prompt}\nRick Sanchez:"
 
         # Tokenize
         inputs = self.tokenizer(
@@ -131,9 +133,11 @@ class RickInference:
 
     def _truncate_at_next_speaker(self, response: str) -> str:
         """Stop generation if another speaker label appears."""
-        # Example stops: "\nMorty:", "\nBeth:", "\nJerry:"
-        parts = re.split(r"\n\s*[A-Z][A-Za-z0-9' ._-]{1,30}:\s*", response, maxsplit=1)
-        return parts[0].strip() if parts else response
+        # Stops on labels like "Morty:", "Beth::", "Rick and Morty 2's Parents:"
+        # even when they appear mid-line after punctuation.
+        label_re = re.compile(r"(?:(?<=^)|(?<=[\s\.\!\?\-]))(" + SPEAKER_LABEL_RE + r")")
+        m = label_re.search(response)
+        return response[: m.start()].strip() if m else response
 
     def _clean_response(self, response: str) -> str:
         """
@@ -152,7 +156,11 @@ class RickInference:
         response = re.sub(r"\<.*?\>", "", response)
 
         # Remove any remaining speaker labels if they appear
-        response = re.sub(r"(^|\n)\s*[A-Z][A-Za-z0-9' ._-]{1,30}:\s*", " ", response)
+        response = re.sub(
+            r"(^|[\s\.\!\?])\s*" + SPEAKER_LABEL_RE,
+            " ",
+            response,
+        )
 
         # Collapse multiple spaces and newlines
         response = re.sub(r"\s+", " ", response).strip()

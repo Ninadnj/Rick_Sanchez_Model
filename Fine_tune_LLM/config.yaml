@@ -41,7 +41,9 @@ data:
   max_length: 512
   train_split: 0.8
   min_dialogue_length: 2  # Keep short character-style replies like "No."
-  context_window_size: 3
+  context_window_size: 1  # Use nearest user turn for better question/answer alignment
+  use_single_turn_prompt: true
+  require_question_prompt: true
   data_dir: "./data"
 
 # Google Drive (for Colab)
