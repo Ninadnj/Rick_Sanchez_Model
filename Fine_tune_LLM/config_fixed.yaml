@@ -1,0 +1,49 @@
+# Configuration for Rick Sanchez Fine-Tuning
+
+# Model Configuration
+model:
+  name: "gpt2-medium"  # or "meta-llama/Llama-2-7b-hf" for better quality
+  use_4bit: true  # Enable 4-bit quantization for Colab
+  
+# LoRA Configuration
+lora:
+  r: 16  # Rank - balance between model capacity and efficiency
+  lora_alpha: 32  # Alpha scaling - typically 2x the rank
+  lora_dropout: 0.05  # Low dropout for stable training
+  target_modules:
+    - "c_attn"  # For GPT-2 (attention projection)
+    - "c_proj"  # For GPT-2 (output projection)
+    # For Llama-2, use: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# Training Configuration
+training:
+  output_dir: "./rick-sanchez-model"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  save_total_limit: 3
+  fp16: true  # Mixed precision training
+  gradient_checkpointing: true  # Save memory
+  optim: "paged_adamw_8bit"  # Memory-efficient optimizer
+  max_grad_norm: 0.3
+  
+# Data Configuration
+data:
+  max_length: 512
+  train_split: 0.8
+  min_dialogue_length: 10  # Minimum characters for valid dialogue
+  data_dir: "./data"
+
+# Google Drive (for Colab)
+google_drive:
+  mount_path: "/content/drive"
+  checkpoint_dir: "/content/drive/MyDrive/rick_sanchez_checkpoints"
