@@ -66,19 +66,19 @@ class RickInference:
     def generate_response(
         self,
         prompt: str,
-        max_length: int = 200,
-        temperature: float = 0.7,
-        top_p: float = 0.92,
-        top_k: int = 50,
-        repetition_penalty: float = 1.2,
+        max_new_tokens: int = 120,
+        temperature: float = 0.45,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        repetition_penalty: float = 1.15,
     ) -> str:
         """
         Generate a response as Rick Sanchez.
 
         Args:
             prompt: Input prompt
-            max_length: Maximum length of generated text
-            temperature: Sampling temperature (0.7 = balanced)
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature (lower = more stable)
             top_p: Nucleus sampling parameter
             top_k: Top-k sampling parameter
             repetition_penalty: Penalty for repetitive text
@@ -97,34 +97,43 @@ class RickInference:
         ).to(self.base_model.device)
 
         # Generate
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_length=max_length + len(inputs["input_ids"][0]),
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=3,  # Avoid exact phrase repetition
+        do_sample = temperature > 0
+        generate_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "repetition_penalty": repetition_penalty,
+            "no_repeat_ngram_size": 4,
+            "do_sample": do_sample,
+        }
+        if do_sample:
+            generate_kwargs.update(
+                {
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                }
             )
 
-        # Decode
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **generate_kwargs)
 
-        # Extract response - everything after "Rick Sanchez:"
-        if "Rick Sanchez:" in generated_text:
-            parts = generated_text.split("Rick Sanchez:")
-            response = parts[-1].strip()
-        else:
-            response = generated_text
+        # Decode only newly generated tokens
+        prompt_len = inputs["input_ids"].shape[-1]
+        generated_ids = outputs[0][prompt_len:]
+        response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        response = self._truncate_at_next_speaker(response)
 
         # Clean up the response
         response = self._clean_response(response)
 
         return response
+
+    def _truncate_at_next_speaker(self, response: str) -> str:
+        """Stop generation if another speaker label appears."""
+        # Example stops: "\nMorty:", "\nBeth:", "\nJerry:"
+        parts = re.split(r"\n\s*[A-Z][A-Za-z0-9' ._-]{1,30}:\s*", response, maxsplit=1)
+        return parts[0].strip() if parts else response
 
     def _clean_response(self, response: str) -> str:
         """
@@ -142,8 +151,8 @@ class RickInference:
         response = re.sub(r"\{.*?\}", "", response)
         response = re.sub(r"\<.*?\>", "", response)
 
-        # Remove speaker labels if they appear
-        response = re.sub(r"Rick Sanchez:|Rick:|Morty:", "", response)
+        # Remove any remaining speaker labels if they appear
+        response = re.sub(r"(^|\n)\s*[A-Z][A-Za-z0-9' ._-]{1,30}:\s*", " ", response)
 
         # Collapse multiple spaces and newlines
         response = re.sub(r"\s+", " ", response).strip()
@@ -152,8 +161,8 @@ class RickInference:
         # Look for sentence-ending punctuation
         sentences = re.split(r"([.!?])\s+", response)
         if len(sentences) > 1:
-            # Keep reasonable number of sentences (3-5)
-            max_sentences = 5
+            # Keep reasonable number of sentences
+            max_sentences = 4
             cleaned_sentences = []
             for i in range(0, min(len(sentences), max_sentences * 2), 2):
                 if i + 1 < len(sentences):

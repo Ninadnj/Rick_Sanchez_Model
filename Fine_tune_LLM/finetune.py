@@ -10,7 +10,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
     BitsAndBytesConfig,
-    DataCollatorForLanguageModeling
+    DataCollatorForSeq2Seq,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_from_disk
@@ -126,6 +126,10 @@ class RickFineTuner:
         
         # Apply LoRA
         self.model = get_peft_model(self.model, lora_config)
+
+        if self.config["training"].get("gradient_checkpointing", False):
+            # Required for gradient checkpointing with many causal LM backbones
+            self.model.config.use_cache = False
         
         # Print trainable parameters
         self.model.print_trainable_parameters()
@@ -138,6 +142,15 @@ class RickFineTuner:
         
         self.train_dataset = load_from_disk(str(data_dir / "train"))
         self.val_dataset = load_from_disk(str(data_dir / "val"))
+
+        required_cols = {"input_ids", "attention_mask", "labels"}
+        train_missing = required_cols - set(self.train_dataset.column_names)
+        val_missing = required_cols - set(self.val_dataset.column_names)
+        if train_missing or val_missing:
+            raise ValueError(
+                "Dataset format is outdated. Re-run `python data_preparation.py` with "
+                "the latest code so train/val contain input_ids, attention_mask, labels."
+            )
         
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Val dataset size: {len(self.val_dataset)}")
@@ -184,7 +197,12 @@ class RickFineTuner:
             args=training_args,
             train_dataset=self.train_dataset,
             eval_dataset=self.val_dataset,
-            data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False),
+            data_collator=DataCollatorForSeq2Seq(
+                tokenizer=self.tokenizer,
+                padding=True,
+                label_pad_token_id=-100,
+                return_tensors="pt",
+            ),
         )
         
         # Train

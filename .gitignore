@@ -10,3 +10,7 @@ drive/
 .env
 .env.*
 .DS_Store
+Fine_tune_LLM/rick-sanchez-model/
+Fine_tune_LLM/*.zip
+.DS_Store
+Fine_tune_LLM/.DS_Store

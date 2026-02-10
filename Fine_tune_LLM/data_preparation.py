@@ -14,6 +14,101 @@ from transformers import AutoTokenizer
 
 # Hugging Face Dataset ID
 HF_DATASET_ID = "Prarabdha/Rick_and_Morty_Transcript"
+STAGE_VERBS = (
+    "stumbles",
+    "rubs",
+    "spills",
+    "drags",
+    "pulls",
+    "pushes",
+    "kicking",
+    "jumps",
+    "walks",
+    "runs",
+    "opens",
+    "closes",
+    "lands",
+    "falls asleep",
+    "snoring",
+    "glaring",
+    "tears up",
+    "wipes",
+    "stares",
+    "throws",
+    "presses",
+    "turns on",
+    "begins",
+)
+STAGE_VERB_RE = re.compile(
+    r"\b(" + "|".join(re.escape(v) for v in STAGE_VERBS) + r")\b",
+    flags=re.IGNORECASE,
+)
+SPEECH_HINT_RE = re.compile(
+    r"\b(i|i'm|i've|i'll|you|you're|we|we're|what|why|how|can't|don't|won't|let's)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def is_rick_speaker(name: str) -> bool:
+    """Identify lines likely spoken by Rick (exclude Rick-owned devices/entities)."""
+    if not isinstance(name, str):
+        return False
+    speaker = name.strip().lower()
+    if not speaker:
+        return False
+
+    # Exclude things like "Rick's Car"
+    if re.search(r"rick['’]s\b", speaker):
+        return False
+
+    # Common non-human/system entities that can include "Rick" in name
+    if any(tag in speaker for tag in ("voice", "computer", "intercom", "robot", "ai")):
+        return False
+
+    return bool(re.search(r"\brick\b", speaker))
+
+
+def _looks_like_stage_clause(sentence: str) -> bool:
+    """
+    Heuristic classifier for action/narration fragments in transcript text.
+    """
+    s = sentence.strip()
+    if not s:
+        return False
+
+    # Example from dataset viewer: "stumbles in drunkenly, and turns on the lights."
+    if re.match(r"^[a-z]", s) and STAGE_VERB_RE.search(s):
+        return True
+
+    # Action text often lacks first-person conversational tokens.
+    if STAGE_VERB_RE.search(s) and not SPEECH_HINT_RE.search(s):
+        return True
+
+    # Multi-character scene notes
+    if re.search(r"\b(at the same time|they begin to|starts [a-z]+ing)\b", s, flags=re.I):
+        return True
+
+    return False
+
+
+def _drop_leading_stage_prefix(text: str) -> str:
+    """
+    Remove leading narration when a line starts with stage action before speech.
+    """
+    out = text.strip()
+    for _ in range(3):
+        if not out or not re.match(r"^[a-z]", out):
+            break
+        # Remove up to first sentence/scene delimiter then re-check.
+        m = re.search(r"[\.\!\?\)]\s+", out)
+        if not m:
+            break
+        prefix = out[: m.end()].strip()
+        if _looks_like_stage_clause(prefix):
+            out = out[m.end() :].strip()
+            continue
+        break
+    return out
 
 
 def load_config():
@@ -56,12 +151,25 @@ def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
         
-    # Remove inline stage directions [like this] or (like this)
+    # Remove bracketed stage directions [like this] or (like this)
     text = re.sub(r"[\[\(].*?[\]\)]", "", text)
-    
-    # Remove multiple spaces/newlines
+
+    # Normalize whitespace early
     text = re.sub(r"\s+", " ", text).strip()
-    
+    if not text:
+        return ""
+
+    # Drop common leading narration before spoken content.
+    text = _drop_leading_stage_prefix(text)
+
+    # Filter per-sentence stage clauses while keeping speech.
+    sentences = re.split(r"(?<=[\.\!\?])\s+", text)
+    kept = [s.strip() for s in sentences if s.strip() and not _looks_like_stage_clause(s)]
+    text = " ".join(kept).strip()
+
+    # Final whitespace normalization and punctuation cleanup
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([,;:.!?])", r"\1", text).strip()
     return text
 
 
@@ -89,6 +197,10 @@ def is_valid_dialogue(text: str, min_length: int = 2) -> bool: # Reduced min_len
     # Check for excessive asterisks (action descriptions)
     if cleaned.count("*") > 2:
         return False
+
+    # If cleaned text still looks like pure stage direction, reject
+    if _looks_like_stage_clause(cleaned):
+        return False
         
     # Check for remaining brackets that might have been missed or if line is just brackets
     if re.fullmatch(r"\s*[\[\(].*[\]\)]\s*", text):
@@ -107,7 +219,7 @@ def load_and_process_data(
         max_retries: Maximum number of retry attempts
 
     Returns:
-        list[str]: Context-aware training examples ending with a Rick response
+        list[dict]: Records with "prompt" and "response"
     """
     for attempt in range(max_retries):
         try:
@@ -145,12 +257,11 @@ def load_and_process_data(
 
             # Clean character names
             df["character"] = df["character"].astype(str).str.strip()
-            
-            # Identify Rick's lines using regex
-            # Matches "Rick", "Rick Sanchez", "Rick (C-137)", etc.
-            df["is_rick"] = df["character"].str.fullmatch(r"(?i)rick(\s+sanchez)?.*", na=False)
-            
-            # Fallback if strict regex fails (though broad regex above should catch most)
+
+            # Identify Rick's lines with extra protection against entities like "Rick's Car"
+            df["is_rick"] = df["character"].apply(is_rick_speaker)
+
+            # Fallback to broad match if strict heuristic finds nothing
             if df["is_rick"].sum() == 0:
                 print("⚠️  Warning: No exact matches for 'Rick'. Trying broader matching...")
                 df["is_rick"] = df["character"].str.contains(r"(?i)\brick\b", na=False)
@@ -162,9 +273,13 @@ def load_and_process_data(
                 raise ValueError(f"Insufficient data: only {rick_count} lines found.")
 
             # --- CONTEXT GENERATION ---
-            # We want to train on: Context (Previous speakers) -> Response (Rick)
+            # Train on: Prompt (context + "Rick Sanchez:") -> Response (Rick line)
             training_pairs = []
-            # Number of previous turns to include
+
+            episode_col = next(
+                (c for c in df.columns if c.replace(" ", "").startswith("episode")),
+                None,
+            )
             
             # Helper to format line
             def format_line(idx):
@@ -189,14 +304,19 @@ def load_and_process_data(
                     continue
                     
                 cleaned_response = clean_text(current_line_text)
-                target_response = f"Rick Sanchez: {cleaned_response}"
                 
                 # Build context from previous lines
                 context_lines = []
+                current_episode = df.iloc[i][episode_col] if episode_col else None
+
                 # Look back up to 'context_window_size' lines
                 for j in range(1, context_window_size + 1):
                     prev_idx = i - j
                     if prev_idx < 0:
+                        break
+
+                    # Do not leak context across episode boundaries
+                    if episode_col and df.iloc[prev_idx][episode_col] != current_episode:
                         break
                     
                     # Check if previous line is valid
@@ -206,19 +326,25 @@ def load_and_process_data(
                     ):
                         continue
                         
-                    context_lines.insert(0, format_line(prev_idx))
-                
-                # Construct full prompt only if we have context
-                # (Training on context-less lines is okay for style, but context is better)
-                if context_lines:
-                    full_prompt = "\n".join(context_lines) + "\n" + target_response
-                else:
-                    # Fallback for start of conversations
-                    full_prompt = target_response
-                    
-                training_pairs.append(full_prompt)
+                    context_speaker = str(df.iloc[prev_idx]["character"]).strip()
+                    # Keep prompt style closer to inference (user asks, Rick responds)
+                    if re.match(r"(?i)^rick(\s+sanchez)?.*", context_speaker):
+                        continue
 
-            print(f"✓ Generated {len(training_pairs)} training examples with context.")
+                    context_lines.insert(0, format_line(prev_idx))
+
+                # Skip examples without preceding context to reduce noisy continuation behavior
+                if not context_lines:
+                    continue
+
+                prompt = "\n".join(context_lines) + "\nRick Sanchez:"
+                # Leading space keeps tokenization natural after colon
+                response = f" {cleaned_response}"
+                training_pairs.append({"prompt": prompt, "response": response})
+
+            print(
+                f"✓ Generated {len(training_pairs)} supervised examples with context."
+            )
             return training_pairs
 
         except Exception as e:
@@ -233,50 +359,51 @@ def load_and_process_data(
                 raise
 
 
-def format_for_training(training_pairs, tokenizer, config):
-    """
-    Format pairs for training with EOS token.
-
-    Args:
-        training_pairs: List of prompt strings
-        tokenizer: Tokenizer instance
-        config: Configuration dict
-
-    Returns:
-        List of formatted training examples
-    """
-    formatted_data = []
-    
-    for text in training_pairs:
-        # Add EOS token to the end
-        formatted_text = f"{text}{tokenizer.eos_token}"
-        formatted_data.append({"text": formatted_text})
-
-    print(f"✓ Final count: {len(formatted_data)} ready for tokenization.")
-    return formatted_data
-
-
-def create_tokenized_dataset(formatted_data, tokenizer, config):
+def create_tokenized_dataset(training_pairs, tokenizer, config):
     """
     Create and tokenize dataset.
 
     Args:
-        formatted_data: List of formatted examples
+        training_pairs: List of {"prompt", "response"} records
         tokenizer: Tokenizer instance
         config: Configuration dict
 
     Returns:
-        Tokenized HuggingFace dataset
+        Tokenized HuggingFace dataset with masked labels
     """
-    dataset = Dataset.from_list(formatted_data)
+    dataset = Dataset.from_list(training_pairs)
+    max_length = int(config["data"].get("max_length", 512))
 
     def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=config["data"].get("max_length", 512),
-            padding=False,  # Dynamic padding in DataCollator is more efficient
-        )
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_labels = []
+
+        for prompt, response in zip(examples["prompt"], examples["response"]):
+            prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            response_ids = tokenizer(
+                f"{response}{tokenizer.eos_token}", add_special_tokens=False
+            )["input_ids"]
+
+            input_ids = prompt_ids + response_ids
+            labels = ([-100] * len(prompt_ids)) + response_ids
+
+            # Keep the end of the sequence so response tokens are preserved.
+            if len(input_ids) > max_length:
+                input_ids = input_ids[-max_length:]
+                labels = labels[-max_length:]
+
+            attention_mask = [1] * len(input_ids)
+
+            batch_input_ids.append(input_ids)
+            batch_attention_mask.append(attention_mask)
+            batch_labels.append(labels)
+
+        return {
+            "input_ids": batch_input_ids,
+            "attention_mask": batch_attention_mask,
+            "labels": batch_labels,
+        }
 
     print("Tokenizing dataset...")
     tokenized_dataset = dataset.map(
@@ -336,20 +463,20 @@ def main():
         print(f"❌ Failed to load tokenizer: {e}")
         return
 
-    # 3. Format data for training
-    formatted_data = format_for_training(training_pairs, tokenizer, config)
-
-    if len(formatted_data) == 0:
+    if len(training_pairs) == 0:
         print("❌ No valid training examples after filtering. Aborting.")
         return
 
-    print(f"\n📝 Sample training example (Context -> Response):")
+    print("\n📝 Sample supervised training example:")
     print("-" * 40)
-    print(formatted_data[0]['text'][:500]) # Print first 500 chars
+    print("Prompt:")
+    print(training_pairs[0]["prompt"][:500])
+    print("\nResponse:")
+    print(training_pairs[0]["response"][:300])
     print("-" * 40)
 
     # 4. Tokenize dataset
-    tokenized_dataset = create_tokenized_dataset(formatted_data, tokenizer, config)
+    tokenized_dataset = create_tokenized_dataset(training_pairs, tokenizer, config)
 
     # 5. Split into train/validation sets
     train_test_split_ratio = config["data"].get("train_split", 0.8)
