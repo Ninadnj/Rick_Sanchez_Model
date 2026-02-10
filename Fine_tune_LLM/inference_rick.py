@@ -252,7 +252,8 @@ def main():
     print("=" * 60 + "\n")
 
     # Get model paths
-    base_model = "gpt2-medium"
+    config = load_config()
+    base_model = config["model"]["name"] if config else "gpt2-medium"
     adapter_path = get_adapter_path()
 
     print(f"Base model: {base_model}")

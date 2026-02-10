@@ -15,7 +15,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_from_disk
 import yaml
-import os
+from pathlib import Path
 
 
 class RickFineTuner:
@@ -28,13 +28,48 @@ class RickFineTuner:
         Args:
             config_path: Path to YAML configuration file
         """
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+        self.config, self.config_file = self._load_config(config_path)
+        self.project_dir = self.config_file.parent
         
         self.model = None
         self.tokenizer = None
         self.train_dataset = None
         self.val_dataset = None
+
+    def _load_config(self, config_path: str):
+        """Load config from cwd or script directory and return resolved file path."""
+        script_dir = Path(__file__).resolve().parent
+        candidates = [Path(config_path), Path("config_fixed.yaml")]
+
+        for candidate in candidates:
+            # Absolute path provided directly
+            if candidate.is_absolute() and candidate.exists():
+                with open(candidate, "r") as f:
+                    return yaml.safe_load(f), candidate
+
+            # Relative to current working directory
+            cwd_candidate = Path.cwd() / candidate
+            if cwd_candidate.exists():
+                with open(cwd_candidate, "r") as f:
+                    return yaml.safe_load(f), cwd_candidate
+
+            # Relative to this script directory
+            script_candidate = script_dir / candidate
+            if script_candidate.exists():
+                with open(script_candidate, "r") as f:
+                    return yaml.safe_load(f), script_candidate
+
+        raise FileNotFoundError(
+            "No configuration file found. Expected config.yaml or config_fixed.yaml "
+            "in the current directory or script directory."
+        )
+
+    def _resolve_from_project(self, path_value: str) -> Path:
+        """Resolve relative config paths from the config file directory."""
+        path = Path(path_value)
+        if path.is_absolute():
+            return path
+        return (self.project_dir / path).resolve()
     
     def load_model_and_tokenizer(self):
         """Load base model and tokenizer with 4-bit quantization."""
@@ -99,10 +134,10 @@ class RickFineTuner:
         """Load preprocessed training and validation datasets."""
         print("Loading datasets...")
         
-        data_dir = self.config['data']['data_dir']
+        data_dir = self._resolve_from_project(self.config["data"]["data_dir"])
         
-        self.train_dataset = load_from_disk(f"{data_dir}/train")
-        self.val_dataset = load_from_disk(f"{data_dir}/val")
+        self.train_dataset = load_from_disk(str(data_dir / "train"))
+        self.val_dataset = load_from_disk(str(data_dir / "val"))
         
         print(f"Train dataset size: {len(self.train_dataset)}")
         print(f"Val dataset size: {len(self.val_dataset)}")
@@ -110,9 +145,10 @@ class RickFineTuner:
     def setup_training_arguments(self) -> TrainingArguments:
         """Setup training arguments."""
         training_config = self.config['training']
+        output_dir = str(self._resolve_from_project(training_config["output_dir"]))
         
         return TrainingArguments(
-            output_dir=training_config['output_dir'],
+            output_dir=output_dir,
             num_train_epochs=training_config['num_train_epochs'],
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             per_device_eval_batch_size=training_config['per_device_eval_batch_size'],
@@ -126,6 +162,7 @@ class RickFineTuner:
             eval_strategy="steps",
             save_total_limit=training_config['save_total_limit'],
             fp16=training_config['fp16'],
+            gradient_checkpointing=training_config.get("gradient_checkpointing", False),
             optim=training_config['optim'],
             max_grad_norm=training_config['max_grad_norm'],
             load_best_model_at_end=True,
@@ -162,7 +199,9 @@ class RickFineTuner:
     def save_model(self, output_dir: str = None):
         """Save the fine-tuned model."""
         if output_dir is None:
-            output_dir = self.config['training']['output_dir']
+            output_dir = str(self._resolve_from_project(self.config["training"]["output_dir"]))
+        else:
+            output_dir = str(self._resolve_from_project(output_dir))
         
         print(f"Saving model to {output_dir}...")
         

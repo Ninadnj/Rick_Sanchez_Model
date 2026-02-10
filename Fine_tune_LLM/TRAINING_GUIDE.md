@@ -35,9 +35,8 @@ Replace `YOUR_GITHUB_USERNAME/YOUR_REPO_NAME` with your actual repo details.
 
 ```python
 !git clone https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME.git
-%cd YOUR_REPO_NAME
+%cd YOUR_REPO_NAME/Fine_tune_LLM
 !pip install -r requirements.txt
-!pip install datasets peft bitsandbytes trl
 ```
 
 ### Cell 2: Login to Hugging Face
